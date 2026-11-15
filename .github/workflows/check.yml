@@ -4,6 +4,8 @@ on:
   schedule:
     # 每 5 分鐘執行一次（GitHub 最短允許間隔為 5 分鐘）
     - cron: '*/5 * * * *'
+  push:
+    branches: [ master, main ]
   workflow_dispatch: # 支援在 GitHub 網頁手動觸發測試
 
 jobs:
