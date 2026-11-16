@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 PTT new-post notifications (Render Web Service + Standalone version)
-Includes a built-in micro HTTP server for Render health checks and UptimeRobot keep-alive.
+Includes a robust HTTP server supporting both GET and HEAD for UptimeRobot keep-alive.
 """
 
 import argparse
@@ -13,6 +13,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 import os
 import re
+import socketserver
 import sys
 import threading
 import time
@@ -24,9 +25,7 @@ import urllib.request
 DISCORD_WEBHOOK_URL = ""
 TELEGRAM_BOT_TOKEN = ""
 TELEGRAM_CHAT_ID = ""
-
-# 巡視頻率（秒數）：在 Render 常駐建議設 120 秒（2 分鐘）或 60 秒（1 分鐘）
-CHECK_INTERVAL_SECONDS = 120
+CHECK_INTERVAL_SECONDS = 60
 
 # ------------------------------------------------------------------- rules --
 
@@ -236,7 +235,7 @@ def run_once(dc_url, tg_token, tg_chat):
 
     if not state["seeded"] and not seen_set:
         save_state(new_state)
-        log("第一次啟動：已記錄當前 %d 篇貼文，下次有新貼文時開始推播" % len(current_posts))
+        log("初始化完成：已記錄當前 %d 篇貼文" % len(current_posts))
         return 0
 
     new_posts = [p for p in current_posts if p["key"] not in seen_set]
@@ -266,27 +265,44 @@ def run_once(dc_url, tg_token, tg_chat):
             sent += 1
         time.sleep(1)
 
-    log("發現 %d 篇新文，已發送 %d 則通知" % (len(new_posts), sent))
+    log("發現 %d 篇新文，已送出 %d 則訊息" % (len(new_posts), sent))
     return sent
 
 
 # ----------------------------------------------- Render HTTP Health Check --
 
-class SimpleHealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
+class RobustHealthHandler(BaseHTTPRequestHandler):
+    def _respond(self):
+        msg = b"OK - PTT Bot Alive\n"
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(msg)))
+        self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(b"PTT Notify Bot is alive and running!\n")
+        return msg
+
+    def do_GET(self):
+        msg = self._respond()
+        try:
+            self.wfile.write(msg)
+        except Exception:
+            pass
+
+    def do_HEAD(self):
+        self._respond()
 
     def log_message(self, format, *args):
-        # 靜音正常 HTTP 請求 log，避免 log 太洗版
         return
 
 
+class ThreadingServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 def start_http_server(port):
-    server = HTTPServer(("0.0.0.0", port), SimpleHealthHandler)
-    log("Web 健康檢查伺服器已啟動於 Port %d (專供 Render / UptimeRobot 打卡)" % port)
+    server = ThreadingServer(("0.0.0.0", port), RobustHealthHandler)
+    log("Web 健康檢查伺服器已啟動於 Port %d (支援 GET 與 HEAD 請求)" % port)
     server.serve_forever()
 
 
@@ -316,21 +332,19 @@ def main():
     except ValueError:
         interval = CHECK_INTERVAL_SECONDS
 
-    # 檢查是否有 Render 分配的 PORT
     port_env = os.environ.get("PORT")
     if port_env:
         port = int(port_env)
-        # 啟動背景爬蟲 thread
+        # 背景爬蟲執行緒
         t = threading.Thread(
             target=monitor_loop,
             args=(dc_url, tg_token, tg_chat, interval),
             daemon=True,
         )
         t.start()
-        # 主 thread 跑 HTTP server 滿足 Render 的 Web Service 要求
+        # 主執行緒伺服器響應 Render 與 UptimeRobot
         start_http_server(port)
     else:
-        # 本地直接跑
         monitor_loop(dc_url, tg_token, tg_chat, interval)
 
 
