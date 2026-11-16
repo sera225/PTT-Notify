@@ -1,18 +1,15 @@
-name: PTT Monitor
+name: PTT Monitor (Manual Only)
 
 on:
-  schedule:
-    # 每 5 分鐘執行一次（GitHub 最短允許間隔為 5 分鐘）
-    - cron: '*/5 * * * *'
-  push:
-    branches: [ master, main ]
-  workflow_dispatch: # 支援在 GitHub 網頁手動觸發測試
+  # 已改為由 Render 24 小時常駐執行，因此關閉 GitHub 定時排程避免重複推播
+  # 若想在 GitHub 手動測試仍可點選按鈕觸發
+  workflow_dispatch:
 
 jobs:
   check-and-notify:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 賦予寫入權限，用來保存 ptt_seen.json
+      contents: write
     steps:
       - name: 簽出代碼
         uses: actions/checkout@v4
@@ -25,15 +22,5 @@ jobs:
       - name: 執行 PTT 監控檢查
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          PTT_TELEGRAM_TOKEN: ${{ secrets.PTT_TELEGRAM_TOKEN }}
-          PTT_TELEGRAM_CHAT_ID: ${{ secrets.PTT_TELEGRAM_CHAT_ID }}
         run: |
-          python ptt_notify.py --once
-
-      - name: 儲存已讀文章紀錄 (避免重複推播)
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add ptt_seen.json
-          git commit -m "Update seen state [skip ci]" || exit 0
-          git push
+          python ptt_notify.py

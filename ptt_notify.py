@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""PTT new-post notifications (Supports Discord Webhook & Telegram)"""
+"""
+PTT new-post notifications (Render Web Service + Standalone version)
+Includes a built-in micro HTTP server for Render health checks and UptimeRobot keep-alive.
+"""
 
 import argparse
 import datetime
 import gzip
 import html
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 
 # ---------------------------------------------------------------- settings --
 
-# 1. Discord Webhook 設定（或透過環境變數 DISCORD_WEBHOOK_URL 注入）
 DISCORD_WEBHOOK_URL = ""
-
-# 2. Telegram 設定（或透過環境變數 PTT_TELEGRAM_TOKEN / PTT_TELEGRAM_CHAT_ID 注入）
 TELEGRAM_BOT_TOKEN = ""
 TELEGRAM_CHAT_ID = ""
 
-# 本機常駐巡視頻率（秒數）：預設 180 秒（3 分鐘）
-CHECK_INTERVAL_SECONDS = 180
+# 巡視頻率（秒數）：在 Render 常駐建議設 120 秒（2 分鐘）或 60 秒（1 分鐘）
+CHECK_INTERVAL_SECONDS = 120
 
 # ------------------------------------------------------------------- rules --
 
@@ -50,7 +52,7 @@ STATE_PATH = os.path.join(SCRIPT_DIR, "ptt_seen.json")
 
 
 def log(message):
-    now = datetime.datetime.now().strftime("%H:%M:%S")
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print("[%s] %s" % (now, message), flush=True)
 
 
@@ -62,7 +64,6 @@ def clean_text(raw):
 
 
 def fetch_board(board):
-    """抓取 PTT 看板第一頁 HTML"""
     url = "https://www.ptt.cc/bbs/%s/index.html" % board
     req = urllib.request.Request(
         url,
@@ -79,15 +80,12 @@ def fetch_board(board):
             if res.headers.get("Content-Encoding") == "gzip":
                 raw = gzip.decompress(raw)
             return raw.decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        log("%s 抓取失敗: HTTP %s" % (board, exc.code))
     except Exception as exc:
-        log("%s 抓取失敗: %s: %s" % (board, type(exc).__name__, exc))
+        log("%s 抓取失敗: %s" % (board, exc))
     return None
 
 
 def parse_board(board, content):
-    """解析看板文章列表"""
     posts = []
     chunks = content.split('<div class="r-ent">')
     for chunk in chunks[1:]:
@@ -150,7 +148,6 @@ def save_state(state):
 
 
 def send_discord(webhook_url, text):
-    """發送 Discord Webhook 訊息"""
     if not webhook_url:
         return True, ""
     payload = {"content": text}
@@ -165,11 +162,10 @@ def send_discord(webhook_url, text):
         with urllib.request.urlopen(req, timeout=15) as res:
             return True, ""
     except Exception as exc:
-        return False, "Discord 錯誤: %s" % exc
+        return False, "Discord 發送失敗: %s" % exc
 
 
 def send_telegram(token, chat_id, text):
-    """發送 Telegram 訊息"""
     if not token or not chat_id:
         return True, ""
     url = "https://api.telegram.org/bot%s/sendMessage" % token
@@ -185,12 +181,10 @@ def send_telegram(token, chat_id, text):
         with urllib.request.urlopen(req, timeout=20) as res:
             return True, ""
     except Exception as exc:
-        return False, "Telegram 錯誤: %s" % exc
+        return False, "Telegram 發送失敗: %s" % exc
 
 
 def broadcast(post, tier, dc_url, tg_token, tg_chat, part=None):
-    """發送訊息至已啟用的通知管道"""
-    # 格式化訊息
     if tier == "B":
         head_dc = "🚨 **錯價/神券警報**【%s】%s" % (post["board"], post["title"])
         head_tg = "🚨 錯價警報【%s】%s" % (post["board"], post["title"])
@@ -220,7 +214,6 @@ def broadcast(post, tier, dc_url, tg_token, tg_chat, part=None):
 
 
 def run_once(dc_url, tg_token, tg_chat):
-    """檢查所有看板一次並送出通知"""
     state = load_state()
     seen_set = set(state["seen"])
 
@@ -236,7 +229,6 @@ def run_once(dc_url, tg_token, tg_chat):
                 current_posts.append(post)
 
     if not current_posts:
-        log("未能從任何看板解析貼文，將於下次重試")
         return 0
 
     merged = list(dict.fromkeys(list(state["seen"]) + ordered_keys))
@@ -244,14 +236,13 @@ def run_once(dc_url, tg_token, tg_chat):
 
     if not state["seeded"] and not seen_set:
         save_state(new_state)
-        log("第一次執行：已記錄現有 %d 篇貼文，下次檢查到新文時才會推播" % len(current_posts))
+        log("第一次啟動：已記錄當前 %d 篇貼文，下次有新貼文時開始推播" % len(current_posts))
         return 0
 
     new_posts = [p for p in current_posts if p["key"] not in seen_set]
     save_state(new_state)
 
     if not new_posts:
-        log("檢查完成，無新貼文（看板文章數: %d）" % len(current_posts))
         return 0
 
     sent = 0
@@ -261,12 +252,10 @@ def run_once(dc_url, tg_token, tg_chat):
         if post["board"] in FILTERED_BOARDS and tier != "B":
             continue
         if notified >= MAX_POSTS_PER_RUN:
-            log("新貼文過多，本次僅通知前 %d 篇" % MAX_POSTS_PER_RUN)
             break
         notified += 1
 
         if tier == "B":
-            # 錯價連發 3 則提醒避免漏看
             for part in (1, 2, 3):
                 broadcast(post, tier, dc_url, tg_token, tg_chat, part)
                 sent += 1
@@ -277,56 +266,73 @@ def run_once(dc_url, tg_token, tg_chat):
             sent += 1
         time.sleep(1)
 
-    log("發現 %d 篇新文，已送出 %d 則訊息" % (len(new_posts), sent))
+    log("發現 %d 篇新文，已發送 %d 則通知" % (len(new_posts), sent))
     return sent
 
 
-def main(argv=None):
+# ----------------------------------------------- Render HTTP Health Check --
+
+class SimpleHealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"PTT Notify Bot is alive and running!\n")
+
+    def log_message(self, format, *args):
+        # 靜音正常 HTTP 請求 log，避免 log 太洗版
+        return
+
+
+def start_http_server(port):
+    server = HTTPServer(("0.0.0.0", port), SimpleHealthHandler)
+    log("Web 健康檢查伺服器已啟動於 Port %d (專供 Render / UptimeRobot 打卡)" % port)
+    server.serve_forever()
+
+
+def monitor_loop(dc_url, tg_token, tg_chat, interval):
+    log("PTT 監控核心已啟動，每 %d 秒巡視一次..." % interval)
+    while True:
+        try:
+            run_once(dc_url, tg_token, tg_chat)
+        except Exception as exc:
+            log("巡視過程發生錯誤: %s" % exc)
+        time.sleep(interval)
+
+
+def main():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
 
-    parser = argparse.ArgumentParser(description="PTT 特價/錯價通知 Bot")
-    parser.add_argument("--once", action="store_true", help="僅檢查一次後退出（適合 GitHub Actions）")
-    parser.add_argument("--test", action="store_true", help="發送一則測試通知")
-    args = parser.parse_args(argv)
-
     dc_url = (os.environ.get("DISCORD_WEBHOOK_URL") or DISCORD_WEBHOOK_URL).strip()
     tg_token = (os.environ.get("PTT_TELEGRAM_TOKEN") or TELEGRAM_BOT_TOKEN).strip()
     tg_chat = (os.environ.get("PTT_TELEGRAM_CHAT_ID") or TELEGRAM_CHAT_ID).strip()
 
-    if not dc_url and (not tg_token or not tg_chat):
-        print("【設定提醒】尚未設定通知管道！")
-        print("請在 GitHub Secrets 或檔案中設定 DISCORD_WEBHOOK_URL 或 TELEGRAM 資訊。")
-        return 2
-
-    if args.test:
-        test_msg = "🔔 【測試通知】PTT 價格監控通知服務已成功連線！"
-        if dc_url:
-            ok, err = send_discord(dc_url, test_msg)
-            log("Discord 測試發送: %s" % ("成功" if ok else err))
-        if tg_token and tg_chat:
-            ok, err = send_telegram(tg_token, tg_chat, test_msg)
-            log("Telegram 測試發送: %s" % ("成功" if ok else err))
-        return 0
-
-    if args.once:
-        run_once(dc_url, tg_token, tg_chat)
-        return 0
-
-    log("PTT 監控中: %s（檢查間隔: %d 秒）" % (", ".join(BOARDS), CHECK_INTERVAL_SECONDS))
+    interval_str = os.environ.get("CHECK_INTERVAL_SECONDS")
     try:
-        while True:
-            try:
-                run_once(dc_url, tg_token, tg_chat)
-            except Exception as exc:
-                log("本次檢查出錯: %s: %s" % (type(exc).__name__, exc))
-            time.sleep(CHECK_INTERVAL_SECONDS)
-    except KeyboardInterrupt:
-        log("使用者中斷，停止監控。")
-    return 0
+        interval = int(interval_str) if interval_str else CHECK_INTERVAL_SECONDS
+    except ValueError:
+        interval = CHECK_INTERVAL_SECONDS
+
+    # 檢查是否有 Render 分配的 PORT
+    port_env = os.environ.get("PORT")
+    if port_env:
+        port = int(port_env)
+        # 啟動背景爬蟲 thread
+        t = threading.Thread(
+            target=monitor_loop,
+            args=(dc_url, tg_token, tg_chat, interval),
+            daemon=True,
+        )
+        t.start()
+        # 主 thread 跑 HTTP server 滿足 Render 的 Web Service 要求
+        start_http_server(port)
+    else:
+        # 本地直接跑
+        monitor_loop(dc_url, tg_token, tg_chat, interval)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
